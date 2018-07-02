@@ -1,0 +1,221 @@
+package main
+
+import (
+	"fmt"
+	"goline/api"
+	"goline/protocol"
+
+	"encoding/json"
+	"os"
+	"os/user"
+
+	"github.com/andlabs/ui"
+)
+
+var settings struct {
+	ID        string
+	Password  string
+	AuthToken string
+	Remember  bool
+}
+
+var w ui.Window
+var lineClient api.LineClient
+var configPath string
+
+type friend struct {
+	DisplayName string
+}
+
+func genFriendArray(client api.LineClient) []friend {
+	friendArray := make([]friend, len(client.Contacts))
+	for i, contact := range client.Contacts {
+		friendArray[i].DisplayName = contact.GetDisplayName()
+	}
+	return friendArray
+}
+
+func mainUIFactory(status ui.Label) func() {
+	return func() {
+		//friends := ui.NewTable(reflect.TypeOf(friend{}))
+		//friends.Lock()
+		//data := friends.Data().(*[]friend)
+		//*data = genFriendArray(lineClient)
+		//friends.Unlock()
+		//tab := ui.NewTab()
+		//tab.Append("Friends", friends)
+		//mainWindow := ui.NewWindow("Line", 400, 500, tab)
+		//mainWindow.Show()
+		test := ui.NewLabel("test")
+		mainWindow := ui.NewWindow("Line", 400, 500, test)
+		mainWindow.OnClosing(func() bool {
+			ui.Stop()
+			return true
+		})
+		mainWindow.Show()
+	}
+}
+
+func verificationWindowFactory(pinCode string) ui.Window {
+	verificationTitle := ui.NewLabel("Verify Your ID")
+	verificationContent := ui.NewLabel("Please enter the verification code below into your phone.")
+	pinCodeLabel := ui.NewLabel(pinCode)
+	space := ui.NewStandaloneLabel("")
+	cancel := ui.NewButton("Cancel")
+	pinCodeStack := ui.NewVerticalStack(verificationTitle, verificationContent,
+		space, pinCodeLabel, space,
+		cancel)
+	VerificationWindow := ui.NewWindow("Vericiation", 400, 500, pinCodeStack)
+
+	cancel.OnClicked(func() {
+		go ui.Do(func() {
+			w = loginWindowFactory("Cancel login.")
+			w.Show()
+		})
+	})
+	VerificationWindow.OnClosing(func() bool {
+		w.Close()
+		return true
+	})
+	go func() {
+		authToken, err := lineClient.GetAuthTokenAfterVerify()
+		if err != nil {
+			fmt.Println(err)
+			w = loginWindowFactory("Connot get authorization.")
+			w.Show()
+			return
+		}
+		lineClient.AuthTokenLogin(authToken)
+	}()
+	return VerificationWindow
+}
+
+func getPinCode(status ui.Label) (string, error) {
+	lineClient, err := api.NewLineClient()
+	if err != nil {
+		fmt.Println(err)
+		status.SetText("Connot connect to server.")
+		return "", err
+	}
+	id := settings.ID
+	password := settings.Password
+	errChan := make(chan error)
+	pinCodeChan := make(chan string)
+	go func() {
+		pinCode, err := lineClient.GetPinCode(id, password)
+		errChan <- err
+		pinCodeChan <- pinCode
+
+	}()
+	status.SetText("Get verification code...")
+	err = <-errChan
+	if err != nil {
+		var str string
+		fmt.Println(err)
+		switch v := err.(type) {
+		case *protocol.TalkException:
+			str = v.GetReason()
+		default:
+			str = "Ooooops, something went wrong!"
+		}
+		status.SetText(str)
+		return "", err
+	}
+	return <-pinCodeChan, nil
+
+}
+
+func loginWindowFactory(statusString string) ui.Window {
+	idLabel := ui.NewLabel("ID")
+	idField := ui.NewTextField()
+	idField.SetText(settings.ID)
+	passwordLabel := ui.NewLabel("Password")
+	passwordField := ui.NewPasswordField()
+	passwordField.SetText(settings.Password)
+	status := ui.NewStandaloneLabel(statusString)
+	remember := ui.NewCheckbox("Remember ID and password")
+	remember.SetChecked(settings.Remember)
+	login := ui.NewButton("Login")
+	login.OnClicked(func() {
+		if remember.Checked() {
+			settings.ID = idField.Text()
+			settings.Password = passwordField.Text()
+		} else {
+			settings.ID = ""
+			settings.Password = ""
+		}
+		settings.Remember = remember.Checked()
+		saveSettings()
+		pinCode, err := getPinCode(status)
+		if err != nil {
+			return
+		}
+		go ui.Do(func() {
+			w = verificationWindowFactory(pinCode)
+			w.Show()
+		})
+	})
+	loginStack := ui.NewVerticalStack(idLabel, idField,
+		passwordLabel, passwordField,
+		status, remember, login)
+
+	loginWindow := ui.NewWindow("Line", 400, 500, loginStack)
+	loginWindow.OnClosing(func() bool {
+		ui.Stop()
+		return true
+	})
+	return loginWindow
+}
+
+func saveSettings() {
+	configFile, err := os.OpenFile(configPath, os.O_RDWR, os.FileMode(0666))
+	if err != nil {
+		panic(err)
+	}
+	jsonEncoder := json.NewEncoder(configFile)
+	err = jsonEncoder.Encode(settings)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func initSettings() {
+	usr, err := user.Current()
+	if err != nil {
+		panic(err)
+	}
+	configPath = usr.HomeDir + "/.goline.json"
+	configFile, err := os.OpenFile(configPath, os.O_RDWR|os.O_CREATE, os.FileMode(0666))
+	if err != nil {
+		panic(err)
+	}
+
+	jsonDecoder := json.NewDecoder(configFile)
+	err = jsonDecoder.Decode(&settings)
+	if err != nil {
+		configFile.Close()
+		configFile, err := os.Create(configPath)
+		if err != nil {
+			panic(err)
+		}
+		jsonEncoder := json.NewEncoder(configFile)
+		err = jsonEncoder.Encode(settings)
+		if err != nil {
+			panic(err)
+		}
+	}
+	configFile.Close()
+}
+
+func main() {
+	initSettings()
+
+	go ui.Do(func() {
+		w = loginWindowFactory("")
+		w.Show()
+	})
+	err := ui.Go()
+	if err != nil {
+		panic(err)
+	}
+}
